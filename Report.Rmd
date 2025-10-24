@@ -1,0 +1,461 @@
+---
+title: "Lexi Gover Project 2"
+output:
+  html_document:
+    df_print: paged
+date: "2025-10-19"
+---
+
+**Introduction:**
+
+The study investigates the role of the TYK2 gene in pancreatic β-cell development and their response to interferon-α, a cytokine involved in immune-mediated β-cell stress. The TYK2 gene has been linked to Type 1 Diabetes (T1D), an autoimmune condition that leads to the destruction of pancreatic β-cells responsible for insulin production.The study was performed to examine how TYK2 influences β-cell differentiation and modulates type I interferon (IFN-α) responses, with the goal of increasing understanding of the mechanisms driving T1D onset and identifying potential therapeutic targets for future use. The authors used bioinformatic techniques such as RNA sequencing, differential expression analysis, and gene set enrichment to comprehensively analyze gene expression changes and affected pathways during β-cell development and cytokine exposure, allowing for a better understanding of TYK2’s role in T1D pathogenesis.
+
+
+**Methods:**
+
+The RNA-seq data analyzed in this project originates from the study “The type 1 diabetes gene TYK2 regulates β-cell development and its responses to interferon-α” (Nature Communications). RNA-seq analysis was performed on human paired-end sequencing reads and organized into Nextflow channels for paired-end reads and individual FASTQ files. The FASTQ files channel was generated using transpose to separate paired-end reads into individual files, ensuring FastQC runs once on all 12 samples.Initial quality control of the FASTQ files was performed using FastQC v0.12.1 with the parameters -t and --outdir specified, with all other parameters left at default, to assess sequence quality and GC content.
+
+Human gene annotations were extracted from the provided GTF file using a custom Python script (gene_extract.py) executed in a pandas v2.2.3 container with the parameters -i and -o specified, with all other parameters left at default, to map Ensembl gene IDs to gene symbols. A genome index for the human reference genome was generated using STAR v2.7.11b with the parameters --runThreadN, --genomeDir, --genomeFastaFiles, and --sjdbGTFfile specified, with all other parameters left at default. Paired-end reads were aligned to the reference genome using STAR v2.7.11b with the parameters --runThreadN, --genomeDir, --readFilesIn, --readFilesCommand, --outFileNamePrefix, and --outSAMtype specified, producing sorted BAM files and STAR log files, with all other parameters left at default.
+
+The FastQC output zip files along with STAR alignment log files were integrated using MultiQC v1.25 with the parameter -f specified, with all other parameters left at default, to generate a consolidated HTML report. Gene-level quantification was performed using VERSE v0.1.5 with the parameters -S, -a, and -o specified, with all other parameters left at default, generating exon.txt files for each sample. Gene-level counts from all samples were concatenated into a single counts matrix using a Python pandas container with the parameters -i and -o specified, with all other parameters left at default, for downstream normalization, differential expression analysis, and gene set enrichment analysis.
+
+All Nextflow processes were executed on a shared computing cluster using Singularity containers (ghcr.io/bf528/fastqc:latest, ghcr.io/bf528/star:latest, ghcr.io/bf528/multiqc:latest, ghcr.io/bf528/verse:latest, and ghcr.io/bf528/pandas:latest). Computational resources were allocated according to process labels (process_low, process_medium, process_high).
+
+Bioinformatic analyses were performed using R v4.4.3. Initial data processing involved filtering the raw counts matrix by retaining only genes with a minimum total count sum of 10 across 3 samples. Differential expression analysis was conducted using the DESeq2 v1.46.0 package. The resulting log2 Fold Change and adjusted p-values were used for functional enrichment. ENRICHR v3.4 was used on a list of genes significant at an adjusted p-value (padj) threshold, which was chosen to be p<0.01. Gene Set Enrichment Analysis (GSEA) was performed using the FGSEA package v1.32.4, ranking all genes by log2 Fold Change and querying against the MSigDB C2 canonical pathways dataset. For quality control and visualization, counts were normalized using the rlog method from DESeq2. This normalized matrix was then used to perform Principal Component Analysis (PCA) and to generate a sample-to-sample distance heatmap for assessing experimental variability and batch effects. Additionally, DESeq2 differential expression data was used to create a volcano plot and GSEA data was used to create an enriched pathways plot.
+
+**Quality Control Evaluation:**
+
+The RNA-seq reads across all samples ranged from 84.5 million to 118.9 million per sample, indicating a good sequencing depth. According to FASTQC, the Per Base Sequence Content showed warnings for 6 samples and failures for 6 samples, suggesting slight biases in base composition at the start of the reads. Additionally, GC content across all samples was approximately 48–50%. For the Sequence Duplication Levels check, all 12 samples failed with duplicates ranging from 73.7% to 76.2%, indicating a high level of duplicated reads compared to what was expected. This result may be due to the sequencing depth. Overrepresented sequences were detected in all libraries at less than 1% and no significant adapter contamination was found. STAR alignment results showed high overall mapping rates (95.8–97.8% aligned and 91.9–94.0% uniquely aligned), indicating that the reads map well to the reference genome. Overall, despite the duplication rate, the experiment appears to be of sufficient quality for downstream analysis.
+
+
+```{r echo=FALSE, include=FALSE}
+library(DESeq2)
+library(tidyverse)
+library(pheatmap)
+library(fgsea)
+library(msigdbr)
+library(ggplot2)
+library(forcats)
+library(ggrepel)
+library(stringr)
+library(purrr)
+library(knitr)
+
+BiocManager::install("fgsea")
+library(fgsea)
+
+
+install.packages("enrichR")
+library(enrichR)
+```
+
+
+**Filtering the Counts Data:**
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+cts <- as.matrix(type.convert(
+    read.csv("/projectnb/bf528/students/agover11/project-2-agover11/results/all_samples_counts.csv",
+             header = TRUE,
+             row.names = 'gene',
+             check.names = FALSE,
+             stringsAsFactors = FALSE)[-1, ],
+    as.is = TRUE
+))
+
+# Clean column names
+colnames(cts) <- gsub("\\.exon\\.txt\\.exon$", "", colnames(cts))
+
+# Print number of genes before filtering
+n_genes_before <- nrow(cts)
+
+# Keep genes with counts >= 10 in at least 3 samples
+filtered_counts <- cts[rowSums(cts >= 10) >= 3, ]
+
+# After filtering
+n_genes_after <- nrow(filtered_counts)
+
+filter_table <- data.frame(
+  Status = c("Before Filtering", "After Filtering"),
+  Genes = c(n_genes_before, n_genes_after)
+)
+
+kable(filter_table, caption = "Gene Counts Before and After Filtering")
+
+#Preparing data for plots
+counts_before <- data.frame(
+  Total_Counts = rowSums(cts),
+  Log10_Counts = log10(rowSums(cts) + 1),
+  Filter_Status = "Before Filtering"
+)
+
+counts_after <- data.frame(
+  Total_Counts = rowSums(filtered_counts),
+  Log10_Counts = log10(rowSums(filtered_counts) + 1),
+  Filter_Status = "After Filtering (Total Counts >= 10)"
+)
+
+# Combine data for a combined plot (optional, but good for comparison)
+plot_data <- bind_rows(counts_before, counts_after)
+
+
+# Plot: Distribution Before Filtering
+plot_before <- counts_before %>%
+  ggplot(aes(x = Log10_Counts)) +
+  geom_histogram(bins = 50, fill = "lightblue", color = "black") +
+  labs(
+    title = "Distribution of Gene Counts Before Filtering",
+    subtitle = paste0("Total Genes: ", nrow(cts)),
+    x = expression(log[10] * "(Total Gene Counts + 1)"),
+    y = "Number of Genes"
+  ) +
+  theme_minimal()
+
+print(plot_before)
+
+# Plot: Distribution After Filtering
+plot_after <- counts_after %>%
+  ggplot(aes(x = Log10_Counts)) +
+  geom_histogram(bins = 50, fill = "salmon", color = "black") +
+  labs(
+    title = "Distribution of Gene Counts After Filtering",
+    subtitle = paste0("Total Genes: ", nrow(filtered_counts)),
+    x = expression(log[10] * "(Total Gene Counts + 1)"),
+    y = "Number of Genes"
+  ) +
+  theme_minimal()
+
+print(plot_after)
+```
+
+**Filtering Explanation:**
+
+To filter the counts matrix, first, the total read counts for each gene were summed across all samples using rowSums(cts). Then, a filter was applied to keep only genes with total counts greater than or equal to 10 (rowSums(cts) >= 10) for 3 samples. This threshold helps exclude genes with minimal expression that could introduce noise into the differential expression analysis, improving the reliability of the results. The gene count before filtering was 63,241, while after filtering it was reduced to 20,579, removing nearly two-thirds of the genes. The counts matrix was filtered to remove lowly expressed genes in order to retain only those with sufficient read coverage for meaningful downstream analysis. The histograms illustrate this process by showing the distribution of total gene counts before and after filtering, with the post-filter plot demonstrating the removal of low-count genes and a clearer focus on genes with higher expression levels.
+
+**DESeq2 Differential Expression**
+```{r echo=FALSE, include=FALSE}
+# Read gene ID to name mapping 
+gene_map <- read.delim("/projectnb/bf528/students/agover11/project-2-agover11/results/gene_mapping.txt",
+header = FALSE, sep = "\t", stringsAsFactors = FALSE)
+colnames(gene_map) <- c("gene_symbol", "gene_name")
+
+
+samples <- colnames(filtered_counts)
+condition <- ifelse(grepl("exp", samples), "exp", "control")
+coldata <- data.frame(row.names = samples, condition = factor(condition))
+
+
+dds <- DESeqDataSetFromMatrix(countData = filtered_counts,
+colData = coldata,
+design = ~ condition)
+
+dds <- DESeq(dds)
+res <- results(dds)
+```
+
+```{r echo=FALSE}
+res_ordered <- as.data.frame(res) %>%
+filter(!is.na(padj)) %>%
+arrange(padj)
+
+deseq2_res <- res_ordered %>%
+rownames_to_column("symbol") %>%
+left_join(gene_map, by = c("symbol" = "gene_symbol"))
+
+top10_genes <- head(deseq2_res, 10)
+knitr::kable(top10_genes, caption = "Top 10 Differentially Expressed Genes")
+```
+
+```{r echo=FALSE}
+# Filter DESeq2 results for significant genes (example padj threshold)
+sig_res <- deseq2_res %>% filter(padj < 0.01) %>% select(gene_name)
+
+write.table(sig_res, 
+            file = "/projectnb/bf528/students/agover11/project-2-agover11/results/positive_sig_genes.txt", 
+            col.names = FALSE, 
+            row.names = FALSE, 
+            quote = FALSE)
+```
+
+**ENRICHR Analysis:**
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+# Read in the gene list
+gene_list <- readLines("/projectnb/bf528/students/agover11/project-2-agover11/results/positive_sig_genes.txt")
+
+# Databases to query
+dbs <- c("GO_Biological_Process_2021", "GO_Cellular_Component_2021", "GO_Molecular_Function_2021", "KEGG_2021_Human", "Reactome_2022")
+
+# Run enrichment
+enriched <- enrichr(gene_list, dbs)
+
+# Combine all results into one dataframe with database labels
+all_enrich_df_list <- lapply(dbs, function(db_name) {
+  df <- enriched[[db_name]]
+  if (!is.null(df) && nrow(df) > 0) {
+    df$Database <- db_name
+    return(df)
+  }
+  return(NULL)
+})
+
+all_enrich_df_list <- Filter(Negate(is.null), all_enrich_df_list)
+all_enrich_df <- bind_rows(all_enrich_df_list)
+```
+
+```{r echo=FALSE}
+# Select top 10 enriched pathways and display as a table
+top10_pathways <- all_enrich_df %>%
+  select(Term, Adjusted.P.value, Overlap, Database) %>%
+  head(10)
+
+kable(top10_pathways, caption = "Top 10 Enriched Pathways Across All Databases")
+```
+
+The ENRICHR analysis revealed strong enrichment for extracellular matrix organization, extracellular structure organization, and regulation of cell population proliferation and migration. These pathways suggest that the experiment may have a significant influence in cell–matrix interactions, tissue remodeling, and cell growth dynamics. Additionally, enrichment in kidney development and nervous system development had strong enrichment, indicating that developmental and differentiation-related processes might also be affected.
+
+
+**GSEA Analysis:**
+```{r fig.width=14, fig.height=6, echo=FALSE}
+# --- Rank genes by log2FoldChange ---
+deseq2_res_ordered <- deseq2_res %>%
+  drop_na(gene_name) %>%
+  distinct(gene_name, .keep_all = TRUE) %>%
+  arrange(desc(log2FoldChange))
+
+rnk_list <- setNames(deseq2_res_ordered$log2FoldChange, deseq2_res_ordered$gene_name)
+
+# --- Load pathways (adjust path as needed) ---
+c2_gmt <- "/projectnb/bf528/students/agover11/project-2-agover11/results/c2.cp.v2025.1.Hs.symbols.gmt.txt"
+pathways <- gmtPathways(c2_gmt)
+
+# --- Run FGSEA ---
+fgseaRes <- fgsea(
+  pathways = pathways,
+  stats = rnk_list,
+  minSize = 15,
+  maxSize = 500
+)
+
+# --- Select top N up- and downregulated pathways ---
+top_n <- 10
+
+fgsea_top <- fgseaRes %>%
+  group_by(direction = ifelse(NES > 0, "Upregulated", "Downregulated")) %>%
+  slice_max(order_by = abs(NES), n = top_n) %>%  # pick top by magnitude
+  ungroup() %>%
+  mutate(
+    pathway = factor(pathway, levels = rev(pathway)),
+    significant = padj < 0.01
+  )
+
+# --- Plot grouped FGSEA results ---
+max_abs <- max(abs(fgsea_top$NES))  # maximum magnitude of NES overall
+
+ggplot(fgsea_top, aes(x = NES, y = pathway, fill = -log10(padj))) +
+  geom_col() +
+  facet_wrap(~direction, scales = "free_y", ncol = 1) +
+  scale_x_continuous(limits = c(-max_abs, max_abs)) +  # symmetric limits
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  labs(title = paste("Top", top_n, "Upregulated and Downregulated C2 Pathways"),
+       x = "Normalized Enrichment Score (NES)",
+       y = "Pathway",
+       fill = "-log10(padj)") +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold", size = 12),
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5)
+  ) +
+  coord_cartesian(clip = "off")
+```
+
+The GSEA results identified enrichment in pathways related to collagen assembly, p53 signaling, and integrin signaling (all upregulated). Pathways such as neuronal systems, metabolic/diabetes regulation, and nicotine effects on neurons were also significantly enriched (all downregulated), suggesting potential impacts on cell signaling, apoptosis, and metabolic regulation. Overall, these pathway results indicate that the experimental treatment has potential to alter both cellular communication and structural organization within tissues. 
+
+
+**GSEA and ENRICHR comparison:**
+
+Both analyses highlight extracellular matrix organization (via collagen assembly in GSEA and extracellular matrix organization/structure in ENRICHR) as a major biological process affected by the experiment, which provides evidence of changes in tissue structure and cell–matrix dynamics. However, GSEA uniquely identified neuronal and metabolism-related pathways such as nicotine effects on neurons and diabetes regulation, which were not captured in the ENRICHR analysis. ENRICHR also identified regulation of cell population proliferation and kidney development as significantly affected that were not identified in GSEA. This difference likely arises because ENRICHR uses a discrete list of significant genes against relevant databases, whereas GSEA evaluates all genes ranked by log2 fold change against their own gene set libraries, allowing GSEA to detect broader shifts in pathway activity.
+
+
+**PCA and Heatmap Plots:**
+```{r echo=FALSE, include=FALSE}
+
+# Extract PCA data
+rld <- rlog(dds, blind = FALSE)
+norm_counts <- assay(rld)
+write.csv(norm_counts, "normalized_counts_rlog.csv")
+
+pca_data <- plotPCA(rld, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+
+```
+
+  
+```{r echo=FALSE}
+# Plot PC1 vs PC2
+ggplot(pca_data, aes(PC1, PC2, color = condition)) +
+  geom_point(size = 4) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  ggtitle("PCA of rlog-transformed counts") +
+  theme_minimal()
+
+# Compute sample distances
+sample_dists <- dist(t(norm_counts))
+sample_dist_matrix <- as.matrix(sample_dists)
+
+# Plot heatmap
+pheatmap(sample_dist_matrix,
+         clustering_distance_rows = sample_dists,
+         clustering_distance_cols = sample_dists,
+         main = "Sample-to-Sample Distances")
+```
+
+**PCA:**
+
+The PCA plot demonstrates a clear distinction between the experimental and control samples. Principal component 1 (PC1) captures 86% of the variance which means it has effectively separated the two groups (experimental and control) with tight clustering within each condition with the exception of an outlier in the experimental group. This separation indicates that the major source of variation in the dataset arises from the biological treatment rather than technical noise or batch effects. The consistency within groups suggests good sample quality despite the outlier in the experimental group.
+
+**Sample-to-Sample heatmap:**
+
+The sample-to-sample heatmap further supports these findings by illustrating close clustering of biological replicates. Samples from the same condition (experimental or control) show low distances indicating high similarity and reproducibility among replicates. Conversely, samples from different conditions exhibit higher distances showing meaningful biological differences rather than random variation. The clustering in the heatmap aligns well with the experimental design and expected outcomes.
+
+**Plot comparison:**
+
+Together, the PCA plot and sample-to-sample distance matrix confirm that the experiment successfully captured meaningful differences between the experimental and control groups. The clear separation between groups and tight clustering of replicates indicate that the data is of high quality, reproducible, and minimally affected by technical variation. These results confirm that the observed gene expression patterns accurately reflect the experimental conditions, validating the differential expression analysis and supporting the study’s overall conclusions.
+
+
+**Volcano plot:**
+```{r echo=FALSE}
+top_genes <- top10_genes %>%
+  mutate(Significant = case_when(
+    log2FoldChange > 0 ~ "Up",
+    log2FoldChange < 0 ~ "Down"
+  ))
+
+#use padj < 0.01 because that is more similar to the paper significance threshold of FDR < 0.01
+deseq2_res_volcano <- deseq2_res %>%
+drop_na(log2FoldChange, padj) %>%
+distinct(gene_name, .keep_all = TRUE) %>%
+mutate(Significant = case_when(
+padj < 0.01 & log2FoldChange > 0 ~ "Up",
+padj < 0.01 & log2FoldChange < 0 ~ "Down",
+TRUE ~ "NotSig"
+))
+
+ggplot(deseq2_res_volcano, aes(x = log2FoldChange, y = -log10(padj), color = Significant)) +
+geom_point(alpha = 0.6, size = 1.5) +
+geom_text_repel(data = top_genes, aes(label = gene_name), size = 3, max.overlaps = 10) +
+scale_color_manual(values = c("Up" = "salmon", "Down" = "lightblue", "NotSig" = "gray")) +
+geom_vline(xintercept = c(-.5,.5), linetype = "dashed", color = "black") +
+geom_hline(yintercept = -log10(0.01), linetype = "dashed", color = "black") +
+labs(
+title = "Volcano Plot of RNA-seq Results (Top Genes Labeled)",
+x = "log2(Fold Change)",
+y = "-log10(adj. p-value)"
+) +
+theme_minimal()
+
+sig_counts <- deseq2_res_volcano %>%
+filter(padj < 0.01) %>%
+summarize(
+Up = sum(log2FoldChange > 0),
+Down = sum(log2FoldChange < 0),
+Total = n()
+)
+
+paper_up <- 319
+paper_down <- 412
+
+data_up <- 332
+data_down <- 403
+
+rna_table <- data.frame(
+  Source = c("My RNA-seq", "Reference Study RNA-seq"),
+  Upregulated = c(data_up, paper_up),
+  Downregulated = c(data_down, paper_down)
+)
+
+kable(rna_table, caption = "Comparison of Differentially Expressed Genes")
+
+```
+
+**Comparison of Upregulated and Downregulated Genes:**
+
+Using the significance threshold of p < 0.01, there were 332 upregulated and 403 downregulated significant genes in my findings. In comparison, the study “The type 1 diabetes gene TYK2 regulates β-cell development and its responses to interferon-α” (Nature Communications) reported 319 upregulated and 412 downregulated significant genes. The number of upregulated and downregulated genes identified in my analysis closely aligns with the original study’s results. Minor discrepancies between the two datasets may be attributed to differences in filtering criteria or parameters used during analysis. 
+
+**Enriched Pathways Analysis:**
+```{r fig.width=12, fig.height=10, echo=FALSE}
+
+# Prepare fgsea data
+set.seed(1234)  # reproducibility
+
+fgsea_bar_df <- fgseaRes %>%
+  filter(padj < 0.01) %>%
+  mutate(
+    leadingEdgeSize = map_int(leadingEdge, length),
+    percent_DE_in_pathway = (leadingEdgeSize / size) * 100,
+    direction = ifelse(NES > 0, "Upregulated", "Downregulated"),
+    pathway = str_wrap(pathway, width = 40),
+    padj = ifelse(padj == 0, 1e-300, padj)
+  ) %>%
+  mutate(direction = factor(direction, levels = c("Upregulated", "Downregulated"))) %>%
+  group_by(direction) %>%
+  slice_max(order_by = percent_DE_in_pathway, n = 4) %>%  # top 4 per group
+  mutate(pathway = fct_inorder(pathway)) %>%
+  ungroup()
+
+# Prepare arrow labels after filtering and reordering
+arrow_labels <- fgsea_bar_df %>%
+  group_by(direction) %>%
+  slice_max(percent_DE_in_pathway, n = 1) %>%
+  mutate(
+    label = ifelse(direction == "Upregulated", "↑", "↓"),
+    y = pathway,
+    x = percent_DE_in_pathway + 5
+  ) %>%
+  ungroup()
+
+# Plot
+ggplot(fgsea_bar_df, aes(x = percent_DE_in_pathway, 
+                         y = pathway, 
+                         fill = padj)) +
+  geom_col() +
+  facet_wrap(~ direction, scales = "free_y", ncol = 1, strip.position = "top") +
+  scale_fill_gradient(low = "red", high = "blue", limits = c(0.00, 0.01), name = "Adjusted p-value") +
+  labs(
+    title = "Top Enriched Pathways",
+    x = "Percentage of DE Genes in category / All genes in category (%)",
+    y = "Pathway"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    strip.text = element_text(face = "bold", size = 11),
+    axis.text.y = element_text(size = 7),
+    legend.position = "right"
+  ) +
+  geom_text(
+    data = arrow_labels,
+    aes(x = x, y = y, label = label),
+    hjust = 0,
+    size = 8,
+    fontface = "bold",
+    color = "black",
+    inherit.aes = FALSE
+  ) +
+  coord_cartesian(clip = "off")
+```
+
+**Comparison with ENRICHR Analysis:**
+
+The study identified upregulated pathways including Extracellular matrix organization, Integrin cell surface interactions, ECM proteoglycans, and Signaling by Receptor Tyrosine Kinases, while downregulated pathways included Regulation of beta-cell development, Neuronal System, and Regulation of gene expression in beta cells. My ENRICHR analysis aligned closely with their upregulated findings, as several of the most significantly enriched biological processes also involved extracellular matrix structure and organization (extracellular matrix organization, extracellular structure organization, and external encapsulating structure organization). These results largely reflect the ECM-related pathways identified in the original study, consistent with the discussion emphasizing TYK2’s role in regulating β-cell differentiation through extracellular matrix and RTK signaling. This overlap supports the study’s observation of increased ECM-related activity, which may reflect remodeling during β-cell stress responses. However, ENRICHR also identified broader developmental terms such as regulation of cell population proliferation and kidney development, which were not highlighted in the study. These discrepancies may arise from differences in databases or the statistical methods used.
+
+**Comparison with GSEA Analysis:**
+
+My GSEA analysis reflected some overlap with the study’s pathways, including Extracellular Matrix Organization as an enriched upregulated pathway and Neuronal System as downregulated. Among my top upregulated pathways were WP IL18 Signaling, REACTOME Extracellular Matrix Organization, PID P53 Downstream Pathway, and Reactome Assembly of Collagen Fibrils and Other Multimeric Structures. Among the downregulated pathways were REACTOME Signaling by GPCR, REACTOME Transmission Across Chemical Synapses, REACTOME Neuronal System, and WP Cell Lineage Map for Neuronal Differentiation. The shared enrichment of Extracellular Matrix Organization is consistent with the study’s findings, suggesting similar transcriptional activation of ECM-associated genes. In contrast, my results showed a stronger decrease in neuronal development and signaling pathways, like the Neuronal System and Synaptic Transmission, along with reduced activity in signaling pathways such as those involving GPCRs. This may suggest an overall reduction in cellular communication and neuronal function.
+
+**Differences Between My Analysis and the Original Study:**
+
+These discrepancies likely arose from differences in filtering strategies applied to the expression data, the use of different versions of the human reference genome (GTF file) during read alignment, and variations in the analysis software or module versions employed to process the raw data.
+
+```{r echo=FALSE, include=FALSE}
+sessionInfo()
+```
