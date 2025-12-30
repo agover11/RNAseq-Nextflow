@@ -31,4 +31,4 @@ This project investigates the role of the **TYK2 gene** in human pancreatic β-c
 - PCA, heatmap, and volcano plot visualizations
 
 ## References
-*The type 1 diabetes gene TYK2 regulates β-cell development and its responses to interferon-α*. Nature Communications. https://www.nature.com/articles/s41467-022-34349-7  
+Chandra, V., Ibrahim, H., Halliez, C. et al. The type 1 diabetes gene TYK2 regulates β-cell development and its responses to interferon-α. Nat Commun 13, 6363 (2022). https://doi.org/10.1038/s41467-022-34069-z
